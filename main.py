@@ -1,14 +1,10 @@
 import json, re, base64, hashlib
 from statistics import mean, median, pstdev, pvariance, mode
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 import httpx
 import config
-import binascii
-import os
-
 app = FastAPI()
 # CORS wide open — grader calls from a Cloudflare Worker
 app.add_middleware(
@@ -91,105 +87,60 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 # ================= Q2: /answer-image =================
-
-class ImageQuestion(BaseModel):
-    image_base64: str
-    question: str
-
-def get_mime_type(image_bytes: bytes) -> str:
-    """Work out whether the image is PNG, JPEG, or WebP."""
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
-        return "image/webp"
-
-    raise HTTPException(
-        status_code=400,
-        detail="Image must be PNG, JPEG, or WebP."
-    )
-
+def normalize_answer(ans):
+    """Clean a vision answer so it matches the grader's expected string.
+    Numeric answers: strip currency/commas/units, keep the bare number.
+    Text answers (e.g. a category name): keep as-is, trimmed."""
+    s = str(ans).strip()
+    if not s:
+        return s
+    # If it looks numeric once symbols/commas/spaces are removed, return the number.
+    cleaned = re.sub(r"[,\s]", "", s)
+    cleaned = re.sub(r"[₹$€£%]", "", cleaned)
+    m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if m and re.fullmatch(r"[^\dA-Za-z]*-?\d[\d,.\s₹$€£%]*", s.strip()):
+        num = m.group(0)
+        # drop trailing ".0" so 240.0 -> 240 (matches integer-style expected values)
+        if "." in num:
+            num = num.rstrip("0").rstrip(".")
+        return num
+    return s
 
 @app.post("/answer-image")
-def answer_image(request: ImageQuestion):
-    # Allow either plain base64 or data:image/png;base64,... format.
-    image_text = request.image_base64.strip()
-
-    if image_text.startswith("data:"):
-        try:
-            image_text = image_text.split(",", 1)[1]
-        except IndexError:
-            raise HTTPException(status_code=400, detail="Invalid image data URL.")
-
-    # Check that the supplied text is genuinely base64.
-    try:
-        image_bytes = base64.b64decode(image_text, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="image_base64 is invalid.")
-
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="The image is empty.")
-
-    mime_type = get_mime_type(image_bytes)
-
-    prompt = f"""
-Answer this question about the image:
-
-{request.question}
-
-Return only the final answer as plain text.
-Do not explain your reasoning.
-For numeric answers, return only the number:
-- correct: 4089.35
-- wrong: ₹4089.35
-- wrong: The total is 4089.35
-"""
-
-    payload = {
-        # A vision-capable model available through OpenRouter / AI Pipe.
-        "model": "google/gemini-2.5-flash",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_text}"
-                        }
-                    }
-                ]
-            }
+async def answer_image(request: Request):
+    body = await request.json()
+    img_b64 = body.get("image_base64", "")
+    question = body.get("question", "")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text":
+                "You read charts, receipts, tables, invoices and pie charts EXACTLY.\n"
+                "Work in steps in a 'work' field, then give the final 'answer':\n"
+                "1. TRANSCRIBE every relevant label and number you see, one by one "
+                "(e.g. each bar's value, each receipt line, each table cell). Read "
+                "digits carefully; do not round or estimate.\n"
+                "2. If the question needs arithmetic (sum of all bars, grand total, "
+                "max/min of a column, total including tax), compute it step by step "
+                "and DOUBLE-CHECK the sum by re-adding.\n"
+                "3. Final 'answer': if NUMERIC, output ONLY the bare number — no "
+                "currency symbol, no thousands separators, no units, no words. Keep "
+                "decimals exactly as shown (e.g. a money total 4089.35 stays 4089.35). "
+                "If TEXT (e.g. the largest pie category), output it EXACTLY as written "
+                "in the image.\n"
+                "Return JSON: {\"work\": \"...\", \"answer\": \"...\"}.\n"
+                f"Question: {question}"},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
         ],
-        "temperature": 0
-    }
-
+    }]
     try:
-        response = requests.post(
-            AIPIPE_URL,
-            headers={
-                "Authorization": f"Bearer {AIPIPE_TOKEN}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=90
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        answer = data["choices"][0]["message"]["content"].strip()
-
-    except requests.RequestException:
-        raise HTTPException(status_code=502, detail="AI Pipe could not be reached.")
-    except (KeyError, IndexError, TypeError):
-        raise HTTPException(status_code=502, detail="AI Pipe returned an unexpected response.")
-
-    # Required: answer is always a string.
-    return {"answer": str(answer)}
-
-
+        # Full gpt-4o at high image detail reads small chart/receipt labels accurately.
+        out = parse_json(await chat(messages, model=config.VISION_MODEL, max_tokens=1200))
+        ans = normalize_answer(out.get("answer", ""))
+    except Exception as e:
+        ans = ""
+    return {"answer": str(ans)}
 # ================= Q3 + Q7: /extract =================
 @app.post("/extract")
 async def extract(request: Request):
