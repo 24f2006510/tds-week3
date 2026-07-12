@@ -94,15 +94,17 @@ def normalize_answer(ans):
     s = str(ans).strip()
     if not s:
         return s
-    # If it looks numeric once symbols/commas/spaces are removed, return the number.
     cleaned = re.sub(r"[,\s]", "", s)
     cleaned = re.sub(r"[₹$€£%]", "", cleaned)
     m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
     if m and re.fullmatch(r"[^\dA-Za-z]*-?\d[\d,.\s₹$€£%]*", s.strip()):
         num = m.group(0)
-        # drop trailing ".0" so 240.0 -> 240 (matches integer-style expected values)
+        # drop trailing ".0"/".00" so 240.0 -> 240, but keep MEANINGFUL trailing
+        # zeros exactly as read (4089.50 must stay "4089.50", not become "4089.5")
         if "." in num:
-            num = num.rstrip("0").rstrip(".")
+            int_part, dec_part = num.split(".", 1)
+            if set(dec_part) == {"0"}:
+                num = int_part
         return num
     return s
 
