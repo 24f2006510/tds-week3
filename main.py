@@ -1,10 +1,14 @@
 import json, re, base64, hashlib
 from statistics import mean, median, pstdev, pvariance, mode
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import httpx
 import config
+import binascii
+import os
+
 app = FastAPI()
 # CORS wide open — grader calls from a Cloudflare Worker
 app.add_middleware(
@@ -87,62 +91,80 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 # ================= Q2: /answer-image =================
-def normalize_answer(ans):
-    """Clean a vision answer so it matches the grader's expected string.
-    Numeric answers: strip currency/commas/units, keep the bare number.
-    Text answers (e.g. a category name): keep as-is, trimmed."""
-    s = str(ans).strip()
-    if not s:
-        return s
-    cleaned = re.sub(r"[,\s]", "", s)
-    cleaned = re.sub(r"[₹$€£%]", "", cleaned)
-    m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
-    if m and re.fullmatch(r"[^\dA-Za-z]*-?\d[\d,.\s₹$€£%]*", s.strip()):
-        num = m.group(0)
-        # drop trailing ".0"/".00" so 240.0 -> 240, but keep MEANINGFUL trailing
-        # zeros exactly as read (4089.50 must stay "4089.50", not become "4089.5")
-        if "." in num:
-            int_part, dec_part = num.split(".", 1)
-            if set(dec_part) == {"0"}:
-                num = int_part
-        return num
-    return s
+
+class ImageQuestion(BaseModel):
+    image_base64: str
+    question: str
+
+def image_mime_type(image_bytes: bytes) -> str:
+    """Identify common image types from their first few bytes."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+
+    raise HTTPException(
+        status_code=400,
+        detail="Please send a PNG, JPEG, or WebP image."
+    )
+
 
 @app.post("/answer-image")
-async def answer_image(request: Request):
-    body = await request.json()
-    img_b64 = body.get("image_base64", "")
-    question = body.get("question", "")
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text":
-                "You read charts, receipts, tables, invoices and pie charts EXACTLY.\n"
-                "Work in steps in a 'work' field, then give the final 'answer':\n"
-                "1. TRANSCRIBE every relevant label and number you see, one by one "
-                "(e.g. each bar's value, each receipt line, each table cell). Read "
-                "digits carefully; do not round or estimate.\n"
-                "2. If the question needs arithmetic (sum of all bars, grand total, "
-                "max/min of a column, total including tax), compute it step by step "
-                "and DOUBLE-CHECK the sum by re-adding.\n"
-                "3. Final 'answer': if NUMERIC, output ONLY the bare number — no "
-                "currency symbol, no thousands separators, no units, no words. Keep "
-                "decimals exactly as shown (e.g. a money total 4089.35 stays 4089.35). "
-                "If TEXT (e.g. the largest pie category), output it EXACTLY as written "
-                "in the image.\n"
-                "Return JSON: {\"work\": \"...\", \"answer\": \"...\"}.\n"
-                f"Question: {question}"},
-            {"type": "image_url",
-             "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
-        ],
-    }]
+def answer_image(request: ImageQuestion):
+    # Remove a data-URL prefix if the sender included one.
+    image_text = request.image_base64.strip()
+    if image_text.startswith("data:"):
+        try:
+            image_text = image_text.split(",", 1)[1]
+        except IndexError:
+            raise HTTPException(status_code=400, detail="Invalid image data URL.")
+
+    # Decode once to check that this really is valid base64 image data.
     try:
-        # Full gpt-4o at high image detail reads small chart/receipt labels accurately.
-        out = parse_json(await chat(messages, model=config.VISION_MODEL, max_tokens=1200))
-        ans = normalize_answer(out.get("answer", ""))
-    except Exception as e:
-        ans = ""
-    return {"answer": str(ans)}
+        image_bytes = base64.b64decode(image_text, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="image_base64 is not valid base64.")
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The image is empty.")
+
+    mime_type = image_mime_type(image_bytes)
+
+    instructions = f"""
+Look carefully at the image and answer this question:
+
+{request.question}
+
+Return only the final answer as plain text.
+Do not add explanations, labels, Markdown, currency symbols, or units.
+If the answer is numeric, return only the number, for example: 4089.35.
+"""
+
+    try:
+        response = client.responses.create(
+            model="gpt-5.6",
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": instructions},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{mime_type};base64,{image_text}",
+                    },
+                ],
+            }],
+        )
+    except Exception:
+        raise HTTPException(status_code=502, detail="The AI service could not answer.")
+
+    answer = response.output_text.strip()
+
+    # The assignment requires the value to always be a string.
+    return {"answer": str(answer)}
+
+
 # ================= Q3 + Q7: /extract =================
 @app.post("/extract")
 async def extract(request: Request):
