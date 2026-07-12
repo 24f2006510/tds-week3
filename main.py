@@ -96,8 +96,8 @@ class ImageQuestion(BaseModel):
     image_base64: str
     question: str
 
-def image_mime_type(image_bytes: bytes) -> str:
-    """Identify common image types from their first few bytes."""
+def get_mime_type(image_bytes: bytes) -> str:
+    """Work out whether the image is PNG, JPEG, or WebP."""
     if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if image_bytes.startswith(b"\xff\xd8\xff"):
@@ -107,61 +107,86 @@ def image_mime_type(image_bytes: bytes) -> str:
 
     raise HTTPException(
         status_code=400,
-        detail="Please send a PNG, JPEG, or WebP image."
+        detail="Image must be PNG, JPEG, or WebP."
     )
 
 
 @app.post("/answer-image")
 def answer_image(request: ImageQuestion):
-    # Remove a data-URL prefix if the sender included one.
+    # Allow either plain base64 or data:image/png;base64,... format.
     image_text = request.image_base64.strip()
+
     if image_text.startswith("data:"):
         try:
             image_text = image_text.split(",", 1)[1]
         except IndexError:
             raise HTTPException(status_code=400, detail="Invalid image data URL.")
 
-    # Decode once to check that this really is valid base64 image data.
+    # Check that the supplied text is genuinely base64.
     try:
         image_bytes = base64.b64decode(image_text, validate=True)
     except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="image_base64 is not valid base64.")
+        raise HTTPException(status_code=400, detail="image_base64 is invalid.")
 
     if not image_bytes:
         raise HTTPException(status_code=400, detail="The image is empty.")
 
-    mime_type = image_mime_type(image_bytes)
+    mime_type = get_mime_type(image_bytes)
 
-    instructions = f"""
-Look carefully at the image and answer this question:
+    prompt = f"""
+Answer this question about the image:
 
 {request.question}
 
 Return only the final answer as plain text.
-Do not add explanations, labels, Markdown, currency symbols, or units.
-If the answer is numeric, return only the number, for example: 4089.35.
+Do not explain your reasoning.
+For numeric answers, return only the number:
+- correct: 4089.35
+- wrong: ₹4089.35
+- wrong: The total is 4089.35
 """
 
-    try:
-        response = client.responses.create(
-            model="gpt-5.6",
-            input=[{
+    payload = {
+        # A vision-capable model available through OpenRouter / AI Pipe.
+        "model": "google/gemini-2.5-flash",
+        "messages": [
+            {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": instructions},
+                    {"type": "text", "text": prompt},
                     {
-                        "type": "input_image",
-                        "image_url": f"data:{mime_type};base64,{image_text}",
-                    },
-                ],
-            }],
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_text}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "temperature": 0
+    }
+
+    try:
+        response = requests.post(
+            AIPIPE_URL,
+            headers={
+                "Authorization": f"Bearer {AIPIPE_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=90
         )
-    except Exception:
-        raise HTTPException(status_code=502, detail="The AI service could not answer.")
+        response.raise_for_status()
+        data = response.json()
 
-    answer = response.output_text.strip()
+        answer = data["choices"][0]["message"]["content"].strip()
 
-    # The assignment requires the value to always be a string.
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="AI Pipe could not be reached.")
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(status_code=502, detail="AI Pipe returned an unexpected response.")
+
+    # Required: answer is always a string.
     return {"answer": str(answer)}
 
 
